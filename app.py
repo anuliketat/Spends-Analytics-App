@@ -4,12 +4,10 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from sklearn.linear_model import LinearRegression
 import re
 import os
 import io
 import google.generativeai as genai
-# New import for encryption. You may need to run: pip install cryptography
 from cryptography.fernet import Fernet
 
 # --- Page Configuration ---
@@ -33,11 +31,6 @@ local_css("style.css")
 
 
 # --- ENCRYPTION/DECRYPTION FUNCTIONS for API KEY ---
-# The following functions handle the secure storage of the Google AI API key.
-# Two files will be created in your app's root directory:
-# 1. .secret.key: This is your encryption key. DO NOT DELETE OR SHARE IT.
-# 2. .env.encrypted: This file stores your encrypted API key.
-
 def write_key():
     """Generates a key and save it into a file"""
     key = Fernet.generate_key()
@@ -69,28 +62,29 @@ def decrypt_api_key(key):
         return decrypted_key
     except FileNotFoundError:
         return None
-    except Exception as e:
-        # Handle cases where the key might be invalid or file corrupted
-        st.error(f"Failed to decrypt API key. You may need to provide it again. Error: {e}")
-        # Clean up corrupted files
+    except Exception:
         if os.path.exists(".env.encrypted"):
             os.remove(".env.encrypted")
         return None
 
 
 # --- DATA PROCESSING FUNCTIONS ---
+CATEGORIES_LIST = [
+    "Food & Dining", "Transport", "Shopping", "Bills & Utilities",
+    "Entertainment", "Health & Wellness", "Transfers", "Other"
+]
 
 def get_category(merchant):
     """Categorizes transactions based on merchant name."""
     merchant = str(merchant).lower()
     categories = {
         "Food & Dining": ["zomato", "swiggy", "restaurant", "grocery", "bakery", "eats", "cafe", "dominos"],
-        "Transport": ["uber", "ola", "metro", "fuel", "petrol", "rapido", "railway"],
+        "Transport": ["uber", "ola", "metro", "fuel", "petrol", "rapido", "railway", "bus"],
         "Shopping": ["amazon", "flipkart", "myntra", "zara", "ajio", "shopping", "mart", "market"],
         "Bills & Utilities": ["airtel", "vodafone", "jio", "bsnl", "electricity", "bill", "credit card", "recharge", "gas"],
         "Entertainment": ["netflix", "spotify", "bookmyshow", "pvr", "inox", "movies", "prime video", "hotstar"],
         "Health & Wellness": ["pharmacy", "apollo", "netmeds", "clinic", "hospital", "medplus", "health"],
-        "Transfers": ["upi", "p2a", "p2m", "transfer"],
+        "Transfers": ["upi", "p2a", "p2m", "transfer", "imps", "neft"],
     }
     for category, keywords in categories.items():
         if any(keyword in merchant for keyword in keywords):
@@ -113,7 +107,7 @@ def parse_fallback_format(row_str):
         full_datetime = pd.to_datetime(f"{date_str} {time_str}", format='%d-%m-%y %H:%M:%S')
     merchant_match = re.search(r'UPI/\w+/\w+/([\w\s.-]+)', row_str)
     if merchant_match:
-        merchant = merchant_match.group(1).split('/')[0].strip()
+        merchant = merchant_match.group(1).split('/')[0].strip().replace(' Not you', '')
     else:
         parts = row_str.split(' at ')
         if len(parts) > 1:
@@ -156,11 +150,19 @@ def process_data(data_source):
     if clean_df.empty:
         st.warning("No debit transactions found in the data.")
         return None
-    clean_df['Category'] = clean_df['Merchant'].apply(get_category)
+
+    # --- NEW: Smart Category Application ---
+    if 'Category' not in clean_df.columns:
+        clean_df['Category'] = None
+
+    # Apply auto-categorization only to rows that are uncategorized
+    clean_df['Category'] = clean_df.apply(
+        lambda row: get_category(row['Merchant']) if pd.isna(row['Category']) or row['Category'] == 'Other' else row['Category'],
+        axis=1
+    )
     return clean_df.sort_values(by="Date", ascending=False)
 
 # --- LLM AND CHAT FUNCTIONS ---
-
 def get_system_prompt():
     """Defines the persona and instructions for the LLM."""
     return """
@@ -173,7 +175,8 @@ def get_system_prompt():
     1.  Analyze the user's spending data provided in the prompt.
     2.  Answer the user's specific question.
     3.  Provide one or two concise, actionable insights or a piece of advice related to their question.
-    4.  **Proactively build the user's persona.** After answering, ask a simple, non-intrusive question to learn more about their financial goals.
+    4.  **Proactively build the user's persona.** After answering, ask a simple, non-intrusive question thats realistic and not long term, to learn more about their financial goals.
+    5.  Provide short, crisp, smart and logical response to the user query.
     **Data Context:**
     - The user's transaction data will be provided below in a markdown format.
     - Today's date is {current_date}.
@@ -184,7 +187,7 @@ def get_llm_response(api_key, query, _df, chat_history):
     """Generates a response from the LLM, with caching."""
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
         data_summary = f"""
             Here is a summary of the user's recent financial data:
             **Basic Statistics:**
@@ -204,11 +207,12 @@ def get_llm_response(api_key, query, _df, chat_history):
         return f"Sorry, I encountered an error. Please ensure your API key is correct and has access to the model. Error: {e}"
 
 # --- Main App UI ---
-
 st.title("💸 Your Financial Feed")
 st.markdown("Load your spending data to generate an interactive dashboard.")
 
 # --- Initialize Session State ---
+if 'df' not in st.session_state: st.session_state.df = None
+if 'categorization_complete' not in st.session_state: st.session_state.categorization_complete = False
 if 'api_key' not in st.session_state: st.session_state.api_key = None
 if 'filtered_category' not in st.session_state: st.session_state.filtered_category = None
 if 'show_chat' not in st.session_state: st.session_state.show_chat = False
@@ -219,16 +223,14 @@ encryption_key = load_key()
 if st.session_state.api_key is None:
     st.session_state.api_key = decrypt_api_key(encryption_key)
 
-# --- Data Source Selection ---
+# --- Step 1: Data Upload ---
 st.header("1. Choose Your Data Source")
 source_option = st.radio("Select how to load your spending data:", ("Upload a CSV File", "Use Default Local File (Android)"), index=0, horizontal=True, label_visibility="collapsed")
 
-df = None
 data_source = None
 if source_option == "Upload a CSV File":
     with st.expander("ℹ️ Show required CSV formats"):
-        st.markdown("**1. Standard Format (Recommended):** A CSV with headers like `Date`, `Amount`, `Type`, `Merchant`.")
-        st.dataframe(pd.DataFrame([{'Date': '2025-07-12 18:30:00', 'Amount': 250.75, 'Type': 'debit', 'Merchant': 'Zomato', 'Bank': 'Axis Bank'}, {'Date': '2025-07-11 11:00:00', 'Amount': 1200.00, 'Type': 'debit', 'Merchant': 'Amazon', 'Bank': 'HDFC Bank'}]), use_container_width=True)
+        st.markdown("**1. Standard Format (Recommended):** A CSV with headers like `Date`, `Amount`, `Type`, `Merchant`, and optionally `Category`.")
         st.markdown("**2. Fallback Format:** A CSV with no headers, where each row is a single text block from an SMS.")
     uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
     if uploaded_file: data_source = uploaded_file
@@ -240,14 +242,55 @@ elif source_option == "Use Default Local File (Android)":
         except Exception as e: st.error(f"Error opening local file: {e}")
     else: st.warning("Default file not found. Use the upload option.")
 
-if data_source:
-    df = process_data(data_source)
+if data_source and st.session_state.df is None:
+    st.session_state.df = process_data(data_source)
     if hasattr(data_source, 'close'): data_source.close()
 
-# --- Dashboard Display (only if data is loaded) ---
-if df is not None and not df.empty:
-    st.success(f"Successfully loaded and processed {len(df)} transactions. Your dashboard is ready!")
-    st.header("2. Your Analytical Dashboard")
+# --- Step 2: Interactive Categorization ---
+if st.session_state.df is not None and not st.session_state.categorization_complete:
+    st.header("2. Categorize Your Spending")
+    df = st.session_state.df
+    other_df = df[df['Category'] == 'Other'].copy()
+
+    if other_df.empty:
+        st.success("All transactions are categorized!")
+        st.session_state.categorization_complete = True
+        st.rerun()
+    else:
+        st.info(f"You have {len(other_df)} uncategorized transactions. Let's sort them out!")
+        with st.expander("Update Categories", expanded=True):
+            for i, (index, row) in enumerate(other_df.iterrows()):
+                st.markdown(f"**Merchant:** `{row['Merchant']}` | **Amount:** ₹{row['Amount']:.2f}")
+                
+                # Create a dynamic list of categories including any new ones
+                current_categories = CATEGORIES_LIST.copy()
+                if 'new_categories' in st.session_state:
+                    for cat in st.session_state.new_categories:
+                        if cat not in current_categories:
+                            current_categories.insert(-1, cat)
+                
+                options = current_categories + ["Create New Category..."]
+                new_cat = st.selectbox(f"Select a category for '{row['Merchant']}'", options, key=f"cat_{index}", index=len(options) - 2) # Default to 'Other'
+
+                if new_cat == "Create New Category...":
+                    custom_cat = st.text_input("Enter new category name", key=f"new_cat_input_{index}")
+                    if custom_cat:
+                        st.session_state.df.loc[index, 'Category'] = custom_cat
+                        if 'new_categories' not in st.session_state: st.session_state.new_categories = []
+                        if custom_cat not in st.session_state.new_categories: st.session_state.new_categories.append(custom_cat)
+                else:
+                    st.session_state.df.loc[index, 'Category'] = new_cat
+            
+            if st.button("Confirm All Categories", type="primary"):
+                st.session_state.categorization_complete = True
+                st.success("Categories updated! Your dashboard is ready.")
+                st.rerun()
+
+# --- Step 3: Dashboard Display ---
+if st.session_state.df is not None and st.session_state.categorization_complete:
+    df = st.session_state.df
+    st.success("Your dashboard is ready!")
+    st.header("3. Your Analytical Dashboard")
     st.markdown("---")
     main_content = st.container()
     chat_placeholder = st.empty()
@@ -291,6 +334,65 @@ if df is not None and not df.empty:
                         st.rerun()
                 with col3: st.markdown(f"<div style='text-align: right; color: #D32F2F; font-weight: bold;'>- ₹{row['Amount']:.2f}</div>", unsafe_allow_html=True)
 
+    # --- NEW: Revamped Financial Compass ---
+    st.markdown("---")
+    st.markdown("### 🔮 Your Financial Compass")
+    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Monthly Trend", "Category Deep-Dive", "Spending Habits", "Top Merchants", "Largest Purchases"])
+
+    with tab1:
+        st.markdown("#### How has your spending changed over time?")
+        monthly_spending = df.set_index('Date').resample('ME')['Amount'].sum().reset_index()
+        monthly_spending['Month'] = monthly_spending['Date'].dt.strftime('%b %Y')
+        avg_spending = monthly_spending['Amount'].mean()
+        
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=monthly_spending['Month'], y=monthly_spending['Amount'], name='Monthly Total', marker_color='#1f77b4'))
+        fig.add_hline(y=avg_spending, line_dash="dash", line_color="red", annotation_text=f"Avg: ₹{avg_spending:,.0f}", annotation_position="bottom right")
+        fig.update_layout(title_text='Monthly Spending vs. Average', yaxis_title='Amount (₹)')
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        st.markdown("#### Where does your money go each month?")
+        category_merchant_df = df.groupby(['Category', 'Merchant'])['Amount'].sum().reset_index()
+        fig = px.sunburst(category_merchant_df, path=['Category', 'Merchant'], values='Amount',
+                          title='Spending Breakdown: Categories to Merchants',
+                          color_discrete_sequence=px.colors.qualitative.Pastel)
+        fig.update_layout(margin=dict(t=40, l=0, r=0, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab3:
+        st.markdown("#### Are you a weekday worker or a weekend spender?")
+        df['DayType'] = df['Date'].dt.dayofweek.apply(lambda x: 'Weekend' if x >= 5 else 'Weekday')
+        day_type_spending = df.groupby('DayType')['Amount'].sum()
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = go.Figure(data=[go.Pie(labels=day_type_spending.index, values=day_type_spending.values, hole=.4, title='Weekday vs. Weekend')])
+            fig.update_layout(showlegend=False, annotations=[dict(text='Total Spend', x=0.5, y=0.5, font_size=16, showarrow=False)])
+            st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            weekday_top_cat = df[df['DayType'] == 'Weekday'].groupby('Category')['Amount'].sum().nlargest(5)
+            weekend_top_cat = df[df['DayType'] == 'Weekend'].groupby('Category')['Amount'].sum().nlargest(5)
+            st.write("**Top Weekday Categories:**")
+            st.dataframe(weekday_top_cat)
+            st.write("**Top Weekend Categories:**")
+            st.dataframe(weekend_top_cat)
+
+    with tab4:
+        st.markdown("#### Which merchants get the most of your money?")
+        top_merchants = df.groupby('Merchant')['Amount'].sum().nlargest(10).sort_values(ascending=True)
+        fig = px.bar(top_merchants, x='Amount', y=top_merchants.index, orientation='h', title='Top 10 Merchants by Total Spending',
+                     labels={'y': 'Merchant', 'x': 'Total Amount (₹)'})
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab5:
+        st.markdown("#### What were your biggest single purchases?")
+        largest_purchases = df.nlargest(10, 'Amount')[['Date', 'Merchant', 'Category', 'Amount']]
+        largest_purchases['Date'] = largest_purchases['Date'].dt.strftime('%Y-%m-%d')
+        st.dataframe(largest_purchases, use_container_width=True, hide_index=True)
+
+
     # --- The LLM-Powered Chat ---
     if st.button("🤖 Chat with Fin, Your AI Guide"): st.session_state.show_chat = not st.session_state.show_chat
     if st.session_state.show_chat:
@@ -319,39 +421,22 @@ if df is not None and not df.empty:
                             st.markdown(response)
                     st.session_state.messages.append({"role": "assistant", "content": response})
 
-    # --- Predictive and Prescriptive Analytics ---
+    # --- Download Processed Data ---
     st.markdown("---")
-    st.markdown("### 🔮 Your Financial Compass")
-    col1, col2 = st.columns(2)
-    with col1:
-        with st.container(border=True):
-            st.markdown("#### Spending Forecast")
-            df_ts = df.set_index('Date').resample('D')['Amount'].sum().fillna(0).reset_index()
-            df_ts['time'] = (df_ts['Date'] - df_ts['Date'].min()).dt.days
-            if len(df_ts) > 30:
-                model = LinearRegression().fit(df_ts[['time']], df_ts['Amount'])
-                future_days = pd.DataFrame({'time': range(df_ts['time'].max() + 1, df_ts['time'].max() + 31)})
-                future_days['Date'] = df_ts['Date'].min() + pd.to_timedelta(future_days['time'], unit='d')
-                future_days['forecast'] = model.predict(future_days[['time']])
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df_ts['Date'], y=df_ts['Amount'], mode='lines', name='Actual'))
-                fig.add_trace(go.Scatter(x=future_days['Date'], y=future_days['forecast'], mode='lines', name='Forecast', line=dict(dash='dash')))
-                fig.update_layout(title="Projected Spending (Next 30 Days)", xaxis_title=None, yaxis_title="Amount (₹)", margin=dict(l=20, r=20, t=40, b=20), height=300)
-                st.plotly_chart(fig, use_container_width=True)
-            else: st.write("Not enough data for a forecast (30+ days needed).")
-    with col2:
-        with st.container(border=True):
-            st.markdown("#### Smart Alerts")
-            recurring_payments = df[df['Category'] == 'Bills & Utilities']['Merchant'].value_counts()
-            subscriptions = recurring_payments[recurring_payments >= 2]
-            st.subheader("Subscription Slayer")
-            if not subscriptions.empty: st.info(f"Recurring payments noticed to **{subscriptions.index[0]}**. Still using this?")
-            else: st.success("No potential subscriptions found.")
-            monthly_budget = 50000
-            current_month_spending = df[df['Date'].dt.month == datetime.now().month]['Amount'].sum()
-            st.subheader("Budget Shield")
-            if current_month_spending > monthly_budget: st.error(f"Over budget by ₹{current_month_spending - monthly_budget:,.2f}!")
-            elif current_month_spending > monthly_budget * 0.8: st.warning("You've spent over 80% of your monthly budget.")
-            else: st.success("Spending is on track this month.")
-else:
+    st.header("4. Download Your Data")
+    st.info("Save your categorized data for next time. This will prevent you from having to categorize the same transactions again.")
+    
+    @st.cache_data
+    def convert_df_to_csv(df_to_convert):
+        return df_to_convert.to_csv(index=False).encode('utf-8')
+
+    csv = convert_df_to_csv(df)
+    st.download_button(
+        label="Download Processed CSV",
+        data=csv,
+        file_name=f"processed_spends_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
+
+elif st.session_state.df is None:
     st.info("Awaiting data to build your financial dashboard...")
